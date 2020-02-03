@@ -1,5 +1,7 @@
+// Modified from https://github.com/Butterwire/serverless-plugin-monorepo
 const fs = require('fs-extra')
 const path = require('path')
+const shell = require('shelljs')
 
 // Takes a path and returns all node_modules resolution paths (but not global include paths).
 const getNodeModulePaths = p => {
@@ -13,9 +15,9 @@ const getNodeModulePaths = p => {
 }
 
 // Creates a symlink. Ignores if fails to create due to already existing.
-async function link (target, f, type) {
+async function link (target, f) {
   await fs.ensureDir(path.dirname(f))
-  await fs.symlink(target, f, type)
+  await fs.symlink(target, f)
     .catch(e => {
       if (e.code === 'EEXIST') {
         return
@@ -28,14 +30,8 @@ class ServerlessMonoRepo {
   constructor (serverless) {
     this.serverless = serverless
     this.hooks = {
-//       'package:cleanup': () => this.clean(),
-      'package:initialize': () => this.initialise(),
-      'offline:start:init': () => this.initialise(),
-      'offline:start': () => this.initialise(),
-      'deploy:function:initialize': async () => {
-//         await this.clean()
-        await this.initialise()
-      }
+      'package:cleanup': this.clean.bind(this),
+      'package:initialize': this.packageInitialise.bind(this)
     }
     this.log = msg => serverless.cli.log(msg)
 
@@ -43,7 +39,6 @@ class ServerlessMonoRepo {
     const custom = this.serverless.service.custom || {}
     this.settings = custom.serverlessMonoRepo || {}
     this.settings.path = this.settings.path || this.serverless.config.servicePath
-    this.settings.linkType = 'junction'
   }
 
   async linkPackage (name, fromPath, toPath, created, resolved) {
@@ -56,13 +51,24 @@ class ServerlessMonoRepo {
     const paths = getNodeModulePaths(fromPath)
 
     // Get package file path
-    const pkg = require.resolve(path.join(name, 'package.json'), { paths })
+    let pkg = null
+    try {
+      pkg = require.resolve(path.join(name, 'package.json'), { paths })
+    } catch (error) {
+      // try to get lerna managed deps, if no package found
+      const lernaPath = this.lernaPackages.filter(p => p.name === name).map(p => { return p.location })
+      if (lernaPath.length > 0) {
+        pkg = lernaPath[0] + '/package.json'
+      } else {
+        throw error
+      }
+    }
 
     // Get relative path to package & create link if not an embedded node_modules
     const target = path.relative(path.join(toPath, path.dirname(name)), path.dirname(pkg))
     if ((pkg.match(/node_modules/g) || []).length <= 1 && !created.has(name)) {
       created.add(name)
-      await link(target, path.join(toPath, name), this.settings.linkType)
+      await link(target, path.join(toPath, name))
     }
 
     // Get dependencies
@@ -112,9 +118,12 @@ class ServerlessMonoRepo {
     await clean(path.join(this.settings.path, 'node_modules'))
   }
 
-  async initialise () {
+  async packageInitialise () {
     // Read package JSON
-    const { dependencies = {} } = require(path.join(this.settings.path, 'package.json'))
+    const { dependencies = {}, name } = require(path.join(this.settings.path, 'package.json'))
+
+    // get internal lerna dependencies
+    this.lernaPackages = JSON.parse(shell.exec(`lerna ls --scope=${name} --json --include-filtered-dependencies`).stdout)
 
     // Link all dependent packages
     this.log('Creating dependency symlinks')
